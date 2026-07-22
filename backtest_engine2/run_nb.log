@@ -1,0 +1,333 @@
+[NbConvertApp] Converting notebook C:\Users\User\backtest_engine\backtest_engine2\crypto_ml_factor.ipynb to notebook
+C:\ProgramData\anaconda3\Lib\site-packages\zmq\_future.py:718: RuntimeWarning: Proactor event loop does not implement add_reader family of methods required for zmq. Registering an additional selector thread for add_reader support via tornado. Use `asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())` to avoid this warning.
+  self._get_loop()
+Traceback (most recent call last):
+  File "C:\ProgramData\anaconda3\Lib\site-packages\jupyter_core\utils\__init__.py", line 154, in wrapped
+    asyncio.get_running_loop()
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^
+RuntimeError: no running event loop
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\ProgramData\anaconda3\Scripts\jupyter-nbconvert-script.py", line 10, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\jupyter_core\application.py", line 284, in launch_instance
+    super().launch_instance(argv=argv, **kwargs)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\traitlets\config\application.py", line 1075, in launch_instance
+    app.start()
+    ~~~~~~~~~^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\nbconvertapp.py", line 420, in start
+    self.convert_notebooks()
+    ~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\nbconvertapp.py", line 597, in convert_notebooks
+    self.convert_single_notebook(notebook_filename)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\nbconvertapp.py", line 563, in convert_single_notebook
+    output, resources = self.export_single_notebook(
+                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        notebook_filename, resources, input_buffer=input_buffer
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\nbconvertapp.py", line 487, in export_single_notebook
+    output, resources = self.exporter.from_filename(
+                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        notebook_filename, resources=resources
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\exporters\exporter.py", line 201, in from_filename
+    return self.from_file(f, resources=resources, **kw)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\exporters\exporter.py", line 220, in from_file
+    return self.from_notebook_node(
+           ~~~~~~~~~~~~~~~~~~~~~~~^
+        nbformat.read(file_stream, as_version=4), resources=resources, **kw
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\exporters\notebook.py", line 36, in from_notebook_node
+    nb_copy, resources = super().from_notebook_node(nb, resources, **kw)
+                         ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\exporters\exporter.py", line 154, in from_notebook_node
+    nb_copy, resources = self._preprocess(nb_copy, resources)
+                         ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\exporters\exporter.py", line 353, in _preprocess
+    nbc, resc = preprocessor(nbc, resc)
+                ~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\preprocessors\base.py", line 48, in __call__
+    return self.preprocess(nb, resources)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\preprocessors\execute.py", line 103, in preprocess
+    self.preprocess_cell(cell, resources, index)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbconvert\preprocessors\execute.py", line 124, in preprocess_cell
+    cell = self.execute_cell(cell, index, store_history=True)
+  File "C:\ProgramData\anaconda3\Lib\site-packages\jupyter_core\utils\__init__.py", line 158, in wrapped
+    return loop.run_until_complete(inner)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\ProgramData\anaconda3\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbclient\client.py", line 1062, in async_execute_cell
+    await self._check_raise_for_error(cell, cell_index, exec_reply)
+  File "C:\ProgramData\anaconda3\Lib\site-packages\nbclient\client.py", line 918, in _check_raise_for_error
+    raise CellExecutionError.from_cell_and_msg(cell, exec_reply_content)
+nbclient.exceptions.CellExecutionError: An error occurred while executing the following cell:
+------------------
+# Cell 4 — Rolling Walk-Forward Engine Run
+# Stage 4 • skill: skills/05-engine-single-path.md
+# Paper windows: train=4yr + val=3yr \u2192 7yr rolling fit window (no HP tuning needed)
+# OOS: 1yr per step, 1yr step \u2192 6 non-overlapping windows (2021–2026)
+# Each step: fresh strategy instance, retrained on trailing 7yr of data only.
+
+import sys
+sys.path.insert(0, r'C:\Users\User\backtest_engine')
+
+from backtest.engine import Engine
+import numpy as np
+import pandas as pd
+
+TRAIN_YRS  = 7   # 4yr paper train + 3yr paper validation
+FIRST_TEST = 2021
+LAST_TEST  = 2026
+
+# \u2500\u2500 Build windows \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+windows = []
+panel_end = panel.dates[-1]
+for year in range(FIRST_TEST, LAST_TEST + 1):
+    test_start = pd.Timestamp(f"{year}-01-01")
+    test_end   = min(pd.Timestamp(f"{year}-12-31"), panel_end)
+    fit_start  = test_start - pd.DateOffset(years=TRAIN_YRS)
+    fit_end    = test_start - pd.Timedelta(days=1)
+    train_dates = panel.dates[(panel.dates >= fit_start) & (panel.dates <= fit_end)]
+    test_dates  = panel.dates[(panel.dates >= test_start) & (panel.dates <= test_end)]
+    if len(train_dates) == 0 or len(test_dates) == 0:
+        continue
+    windows.append(dict(year=year, fit_start=fit_start, fit_end=fit_end,
+                        test_start=test_start, test_end=test_end,
+                        train_dates=train_dates, test_dates=test_dates))
+
+print(f"Rolling walk-forward: {TRAIN_YRS}yr fit window, 1yr OOS step")
+print(f"{'Year':>5}  {'Fit window':^25}  {'OOS window':^25}  {'Train':>6}  {'Test':>5}")
+for w in windows:
+    print(f"  {w['year']}  {str(w['fit_start'].date()):>12} -> {str(w['fit_end'].date()):<12}  "
+          f"{str(w['test_start'].date()):>12} -> {str(w['test_end'].date()):<12}  "
+          f"{len(w['train_dates']):>5}  {len(w['test_dates']):>5}")
+
+# \u2500\u2500 Run each window \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+results = []
+strats  = []
+for w in windows:
+    print(f"\n[{w['year']}] Fit {w['fit_start'].date()} \u2192 {w['fit_end'].date()} "
+          f"| OOS {w['test_start'].date()} \u2192 {w['test_end'].date()}")
+    strat  = CryptoMLFactorStrategy(model_type="rf", train_start=w["fit_start"])
+    engine = Engine(panel, strat, costs=costs, liquidity=liq, initial_capital=1_000_000)
+    result = engine.run(train_dates=w["train_dates"], test_dates=w["test_dates"])
+    tr     = result.equity_curve.iloc[-1] / result.metadata["initial_capital"] - 1
+    fitted = strat._fitted_cols_
+    print(f"  Return: {tr:>+8.2%} | Rebals: {result.metadata['n_rebalances']} | "
+          f"Costs: ${result.costs.sum():>9,.0f} | Factors: {len(fitted)}")
+    print(f"  Fitted: {fitted}")
+    results.append((w["year"], result))
+    strats.append(strat)
+
+# \u2500\u2500 Stitch OOS returns into one continuous equity curve \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+all_rets        = pd.concat([r.returns.dropna() for _, r in results]).sort_index()
+stitched_equity = (1 + all_rets).cumprod() * 1_000_000
+total_ret       = stitched_equity.iloc[-1] / 1_000_000 - 1
+span_days       = (all_rets.index[-1] - all_rets.index[0]).days
+ann_ret         = (1 + total_ret) ** (365 / span_days) - 1
+ann_vol         = all_rets.std() * np.sqrt(252)
+sharpe          = ann_ret / ann_vol if ann_vol > 0 else np.nan
+peak            = np.maximum.accumulate(stitched_equity.values)
+max_dd          = ((stitched_equity.values - peak) / np.where(peak > 0, peak, 1)).min()
+total_costs     = sum(r.costs.sum() for _, r in results)
+
+print(f"\n{'='*60}")
+print(f"Rolling Walk-Forward  (RF · {TRAIN_YRS}yr fit · 1yr step · {len(windows)} windows)")
+print(f"Universe  : {len(SYMS)} coins  (CoinGecko top-{UNIVERSE_SIZE}, dynamic)")
+print(f"OOS period: {all_rets.index[0].date()} to {all_rets.index[-1].date()}")
+print(f"{'='*60}")
+print(f"Total return     : {total_ret:>+10.2%}")
+print(f"Ann. return      : {ann_ret:>+10.2%}")
+print(f"Ann. volatility  : {ann_vol:>+10.2%}")
+print(f"Sharpe ratio     : {sharpe:>+10.2f}")
+print(f"Max drawdown     : {max_dd:>+10.2%}")
+print(f"Final equity     : ${stitched_equity.iloc[-1]:>12,.0f}")
+print(f"Total costs      : ${total_costs:>12,.0f}")
+print(f"\n{'Year':>5}  {'Return':>8}  {'Vol':>7}  {'SR':>6}  {'MaxDD':>8}  {'Costs':>10}  {'Rebals':>6}  {'Factors':>8}")
+for (year, res), strat in zip(results, strats):
+    r      = res.returns.dropna()
+    yr_ret = res.equity_curve.iloc[-1] / res.metadata["initial_capital"] - 1
+    yr_vol = r.std() * np.sqrt(252)
+    yr_sr  = (r.mean() * 252) / yr_vol if yr_vol > 0 else np.nan
+    pk     = np.maximum.accumulate(res.equity_curve.values)
+    yr_dd  = ((res.equity_curve.values - pk) / np.where(pk > 0, pk, 1)).min()
+    print(f"  {year}  {yr_ret:>+8.2%}  {yr_vol:>7.2%}  {yr_sr:>6.2f}  "
+          f"{yr_dd:>+8.2%}  ${res.costs.sum():>9,.0f}  {res.metadata['n_rebalances']:>6}  "
+          f"{len(strat._fitted_cols_):>7}")
+------------------
+
+----- stdout -----
+Rolling walk-forward: 7yr fit window, 1yr OOS step
+ Year         Fit window                 OOS window           Train   Test
+  2021    2014-01-01 -> 2020-12-31      2021-01-01 -> 2021-12-31     2298    365
+  2022    2015-01-01 -> 2021-12-31      2022-01-01 -> 2022-12-31     2557    365
+  2023    2016-01-01 -> 2022-12-31      2023-01-01 -> 2023-12-31     2557    365
+  2024    2017-01-01 -> 2023-12-31      2024-01-01 -> 2024-12-31     2556    366
+  2025    2018-01-01 -> 2024-12-31      2025-01-01 -> 2025-12-31     2557    365
+  2026    2019-01-01 -> 2025-12-31      2026-01-01 -> 2026-05-19     2557    139
+
+[2021] Fit 2014-01-01 \u2192 2020-12-31 | OOS 2021-01-01 \u2192 2021-12-31
+----- stdout -----
+  Return:  +21.11% | Rebals: 52 | Costs: $  174,929 | Factors: 15
+  Fitted: ['AA', 'NT', 'MRR', 'TV', 'NTR', 'RMRF', 'SMB', 'UMD', 'SPX', 'VIX', 'USDX', 'GLD', 'WTI', 'GT', 'EPU']
+
+[2022] Fit 2015-01-01 \u2192 2021-12-31 | OOS 2022-01-01 \u2192 2022-12-31
+------------------
+
+[31m---------------------------------------------------------------------------[39m
+[31mValueError[39m                                Traceback (most recent call last)
+[36mCell[39m[36m [39m[32mIn[4][39m[32m, line 49[39m
+[32m     47[39m strat  = CryptoMLFactorStrategy(model_type=[33m"[39m[33mrf[39m[33m"[39m, train_start=w[[33m"[39m[33mfit_start[39m[33m"[39m])
+[32m     48[39m engine = Engine(panel, strat, costs=costs, liquidity=liq, initial_capital=[32m1_000_000[39m)
+[32m---> [39m[32m49[39m result = [43mengine[49m[43m.[49m[43mrun[49m[43m([49m[43mtrain_dates[49m[43m=[49m[43mw[49m[43m[[49m[33;43m"[39;49m[33;43mtrain_dates[39;49m[33;43m"[39;49m[43m][49m[43m,[49m[43m [49m[43mtest_dates[49m[43m=[49m[43mw[49m[43m[[49m[33;43m"[39;49m[33;43mtest_dates[39;49m[33;43m"[39;49m[43m][49m[43m)[49m
+[32m     50[39m tr     = result.equity_curve.iloc[-[32m1[39m] / result.metadata[[33m"[39m[33minitial_capital[39m[33m"[39m] - [32m1[39m
+[32m     51[39m fitted = strat._fitted_cols_
+
+[36mFile [39m[32m~\backtest_engine\backtest\engine\engine.py:167[39m, in [36mEngine.run[39m[34m(self, start, end, train_dates, test_dates)[39m
+[32m    165[39m [38;5;28;01mif[39;00m train_dates [38;5;129;01mis[39;00m [38;5;129;01mnot[39;00m [38;5;28;01mNone[39;00m [38;5;129;01mand[39;00m [38;5;28mlen[39m(train_dates) > [32m0[39m:
+[32m    166[39m     train_end = pd.Timestamp(train_dates[-[32m1[39m])
+[32m--> [39m[32m167[39m     [38;5;28;43mself[39;49m[43m.[49m[43mstrategy[49m[43m.[49m[43mfit[49m[43m([49m[38;5;28;43mself[39;49m[43m.[49m[43mdata[49m[43m.[49m[43mas_of[49m[43m([49m[43mtrain_end[49m[43m)[49m[43m)[49m
+[32m    169[39m rebalance_dates = [38;5;28mself[39m.strategy.rebalance_dates(dates)
+[32m    170[39m rebalance_mask = dates.isin(rebalance_dates)
+
+[36mCell[39m[36m [39m[32mIn[2][39m[32m, line 181[39m, in [36mCryptoMLFactorStrategy.fit[39m[34m(self, data)[39m
+[32m    179[39m [38;5;28;01mwith[39;00m warnings.catch_warnings():
+[32m    180[39m     warnings.simplefilter([33m"[39m[33mignore[39m[33m"[39m)
+[32m--> [39m[32m181[39m     [38;5;28;43mself[39;49m[43m.[49m[43m_pipeline[49m[43m.[49m[43mfit[49m[43m([49m[43mX[49m[43m,[49m[43m [49m[43my[49m[43m)[49m
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\base.py:1365[39m, in [36m_fit_context.<locals>.decorator.<locals>.wrapper[39m[34m(estimator, *args, **kwargs)[39m
+[32m   1358[39m     estimator._validate_params()
+[32m   1360[39m [38;5;28;01mwith[39;00m config_context(
+[32m   1361[39m     skip_parameter_validation=(
+[32m   1362[39m         prefer_skip_nested_validation [38;5;129;01mor[39;00m global_skip_validation
+[32m   1363[39m     )
+[32m   1364[39m ):
+[32m-> [39m[32m1365[39m     [38;5;28;01mreturn[39;00m [43mfit_method[49m[43m([49m[43mestimator[49m[43m,[49m[43m [49m[43m*[49m[43margs[49m[43m,[49m[43m [49m[43m*[49m[43m*[49m[43mkwargs[49m[43m)[49m
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\pipeline.py:663[39m, in [36mPipeline.fit[39m[34m(self, X, y, **params)[39m
+[32m    657[39m     [38;5;28;01mif[39;00m [38;5;28mself[39m._final_estimator != [33m"[39m[33mpassthrough[39m[33m"[39m:
+[32m    658[39m         last_step_params = [38;5;28mself[39m._get_metadata_for_step(
+[32m    659[39m             step_idx=[38;5;28mlen[39m([38;5;28mself[39m) - [32m1[39m,
+[32m    660[39m             step_params=routed_params[[38;5;28mself[39m.steps[-[32m1[39m][[32m0[39m]],
+[32m    661[39m             all_params=params,
+[32m    662[39m         )
+[32m--> [39m[32m663[39m         [38;5;28;43mself[39;49m[43m.[49m[43m_final_estimator[49m[43m.[49m[43mfit[49m[43m([49m[43mXt[49m[43m,[49m[43m [49m[43my[49m[43m,[49m[43m [49m[43m*[49m[43m*[49m[43mlast_step_params[49m[43m[[49m[33;43m"[39;49m[33;43mfit[39;49m[33;43m"[39;49m[43m][49m[43m)[49m
+[32m    665[39m [38;5;28;01mreturn[39;00m [38;5;28mself[39m
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\base.py:1365[39m, in [36m_fit_context.<locals>.decorator.<locals>.wrapper[39m[34m(estimator, *args, **kwargs)[39m
+[32m   1358[39m     estimator._validate_params()
+[32m   1360[39m [38;5;28;01mwith[39;00m config_context(
+[32m   1361[39m     skip_parameter_validation=(
+[32m   1362[39m         prefer_skip_nested_validation [38;5;129;01mor[39;00m global_skip_validation
+[32m   1363[39m     )
+[32m   1364[39m ):
+[32m-> [39m[32m1365[39m     [38;5;28;01mreturn[39;00m [43mfit_method[49m[43m([49m[43mestimator[49m[43m,[49m[43m [49m[43m*[49m[43margs[49m[43m,[49m[43m [49m[43m*[49m[43m*[49m[43mkwargs[49m[43m)[49m
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\ensemble\_forest.py:359[39m, in [36mBaseForest.fit[39m[34m(self, X, y, sample_weight)[39m
+[32m    356[39m [38;5;28;01mif[39;00m issparse(y):
+[32m    357[39m     [38;5;28;01mraise[39;00m [38;5;167;01mValueError[39;00m([33m"[39m[33msparse multilabel-indicator for y is not supported.[39m[33m"[39m)
+[32m--> [39m[32m359[39m X, y = [43mvalidate_data[49m[43m([49m
+[32m    360[39m [43m    [49m[38;5;28;43mself[39;49m[43m,[49m
+[32m    361[39m [43m    [49m[43mX[49m[43m,[49m
+[32m    362[39m [43m    [49m[43my[49m[43m,[49m
+[32m    363[39m [43m    [49m[43mmulti_output[49m[43m=[49m[38;5;28;43;01mTrue[39;49;00m[43m,[49m
+[32m    364[39m [43m    [49m[43maccept_sparse[49m[43m=[49m[33;43m"[39;49m[33;43mcsc[39;49m[33;43m"[39;49m[43m,[49m
+[32m    365[39m [43m    [49m[43mdtype[49m[43m=[49m[43mDTYPE[49m[43m,[49m
+[32m    366[39m [43m    [49m[43mensure_all_finite[49m[43m=[49m[38;5;28;43;01mFalse[39;49;00m[43m,[49m
+[32m    367[39m [43m[49m[43m)[49m
+[32m    368[39m [38;5;66;03m# _compute_missing_values_in_feature_mask checks if X has missing values and[39;00m
+[32m    369[39m [38;5;66;03m# will raise an error if the underlying tree base estimator can't handle missing[39;00m
+[32m    370[39m [38;5;66;03m# values. Only the criterion is required to determine if the tree supports[39;00m
+[32m    371[39m [38;5;66;03m# missing values.[39;00m
+[32m    372[39m estimator = [38;5;28mtype[39m([38;5;28mself[39m.estimator)(criterion=[38;5;28mself[39m.criterion)
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\utils\validation.py:2971[39m, in [36mvalidate_data[39m[34m(_estimator, X, y, reset, validate_separately, skip_check_array, **check_params)[39m
+[32m   2969[39m         y = check_array(y, input_name=[33m"[39m[33my[39m[33m"[39m, **check_y_params)
+[32m   2970[39m     [38;5;28;01melse[39;00m:
+[32m-> [39m[32m2971[39m         X, y = [43mcheck_X_y[49m[43m([49m[43mX[49m[43m,[49m[43m [49m[43my[49m[43m,[49m[43m [49m[43m*[49m[43m*[49m[43mcheck_params[49m[43m)[49m
+[32m   2972[39m     out = X, y
+[32m   2974[39m [38;5;28;01mif[39;00m [38;5;129;01mnot[39;00m no_val_X [38;5;129;01mand[39;00m check_params.get([33m"[39m[33mensure_2d[39m[33m"[39m, [38;5;28;01mTrue[39;00m):
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\utils\validation.py:1385[39m, in [36mcheck_X_y[39m[34m(X, y, accept_sparse, accept_large_sparse, dtype, order, copy, force_writeable, force_all_finite, ensure_all_finite, ensure_2d, allow_nd, multi_output, ensure_min_samples, ensure_min_features, y_numeric, estimator)[39m
+[32m   1366[39m ensure_all_finite = _deprecate_force_all_finite(force_all_finite, ensure_all_finite)
+[32m   1368[39m X = check_array(
+[32m   1369[39m     X,
+[32m   1370[39m     accept_sparse=accept_sparse,
+[32m   (...)[39m[32m   1382[39m     input_name=[33m"[39m[33mX[39m[33m"[39m,
+[32m   1383[39m )
+[32m-> [39m[32m1385[39m y = [43m_check_y[49m[43m([49m[43my[49m[43m,[49m[43m [49m[43mmulti_output[49m[43m=[49m[43mmulti_output[49m[43m,[49m[43m [49m[43my_numeric[49m[43m=[49m[43my_numeric[49m[43m,[49m[43m [49m[43mestimator[49m[43m=[49m[43mestimator[49m[43m)[49m
+[32m   1387[39m check_consistent_length(X, y)
+[32m   1389[39m [38;5;28;01mreturn[39;00m X, y
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\utils\validation.py:1395[39m, in [36m_check_y[39m[34m(y, multi_output, y_numeric, estimator)[39m
+[32m   1393[39m [38;5;250m[39m[33;03m"""Isolated part of check_X_y dedicated to y validation"""[39;00m
+[32m   1394[39m [38;5;28;01mif[39;00m multi_output:
+[32m-> [39m[32m1395[39m     y = [43mcheck_array[49m[43m([49m
+[32m   1396[39m [43m        [49m[43my[49m[43m,[49m
+[32m   1397[39m [43m        [49m[43maccept_sparse[49m[43m=[49m[33;43m"[39;49m[33;43mcsr[39;49m[33;43m"[39;49m[43m,[49m
+[32m   1398[39m [43m        [49m[43mensure_all_finite[49m[43m=[49m[38;5;28;43;01mTrue[39;49;00m[43m,[49m
+[32m   1399[39m [43m        [49m[43mensure_2d[49m[43m=[49m[38;5;28;43;01mFalse[39;49;00m[43m,[49m
+[32m   1400[39m [43m        [49m[43mdtype[49m[43m=[49m[38;5;28;43;01mNone[39;49;00m[43m,[49m
+[32m   1401[39m [43m        [49m[43minput_name[49m[43m=[49m[33;43m"[39;49m[33;43my[39;49m[33;43m"[39;49m[43m,[49m
+[32m   1402[39m [43m        [49m[43mestimator[49m[43m=[49m[43mestimator[49m[43m,[49m
+[32m   1403[39m [43m    [49m[43m)[49m
+[32m   1404[39m [38;5;28;01melse[39;00m:
+[32m   1405[39m     estimator_name = _check_estimator_name(estimator)
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\utils\validation.py:1105[39m, in [36mcheck_array[39m[34m(array, accept_sparse, accept_large_sparse, dtype, order, copy, force_writeable, force_all_finite, ensure_all_finite, ensure_non_negative, ensure_2d, allow_nd, ensure_min_samples, ensure_min_features, estimator, input_name)[39m
+[32m   1099[39m     [38;5;28;01mraise[39;00m [38;5;167;01mValueError[39;00m(
+[32m   1100[39m         [33mf[39m[33m"[39m[33mFound array with dim [39m[38;5;132;01m{[39;00marray.ndim[38;5;132;01m}[39;00m[33m,[39m[33m"[39m
+[32m   1101[39m         [33mf[39m[33m"[39m[33m while dim <= 2 is required[39m[38;5;132;01m{[39;00mcontext[38;5;132;01m}[39;00m[33m.[39m[33m"[39m
+[32m   1102[39m     )
+[32m   1104[39m [38;5;28;01mif[39;00m ensure_all_finite:
+[32m-> [39m[32m1105[39m     [43m_assert_all_finite[49m[43m([49m
+[32m   1106[39m [43m        [49m[43marray[49m[43m,[49m
+[32m   1107[39m [43m        [49m[43minput_name[49m[43m=[49m[43minput_name[49m[43m,[49m
+[32m   1108[39m [43m        [49m[43mestimator_name[49m[43m=[49m[43mestimator_name[49m[43m,[49m
+[32m   1109[39m [43m        [49m[43mallow_nan[49m[43m=[49m[43mensure_all_finite[49m[43m [49m[43m==[49m[43m [49m[33;43m"[39;49m[33;43mallow-nan[39;49m[33;43m"[39;49m[43m,[49m
+[32m   1110[39m [43m    [49m[43m)[49m
+[32m   1112[39m [38;5;28;01mif[39;00m copy:
+[32m   1113[39m     [38;5;28;01mif[39;00m _is_numpy_namespace(xp):
+[32m   1114[39m         [38;5;66;03m# only make a copy if `array` and `array_orig` may share memory`[39;00m
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\utils\validation.py:120[39m, in [36m_assert_all_finite[39m[34m(X, allow_nan, msg_dtype, estimator_name, input_name)[39m
+[32m    117[39m [38;5;28;01mif[39;00m first_pass_isfinite:
+[32m    118[39m     [38;5;28;01mreturn[39;00m
+[32m--> [39m[32m120[39m [43m_assert_all_finite_element_wise[49m[43m([49m
+[32m    121[39m [43m    [49m[43mX[49m[43m,[49m
+[32m    122[39m [43m    [49m[43mxp[49m[43m=[49m[43mxp[49m[43m,[49m
+[32m    123[39m [43m    [49m[43mallow_nan[49m[43m=[49m[43mallow_nan[49m[43m,[49m
+[32m    124[39m [43m    [49m[43mmsg_dtype[49m[43m=[49m[43mmsg_dtype[49m[43m,[49m
+[32m    125[39m [43m    [49m[43mestimator_name[49m[43m=[49m[43mestimator_name[49m[43m,[49m
+[32m    126[39m [43m    [49m[43minput_name[49m[43m=[49m[43minput_name[49m[43m,[49m
+[32m    127[39m [43m[49m[43m)[49m
+
+[36mFile [39m[32mC:\ProgramData\anaconda3\Lib\site-packages\sklearn\utils\validation.py:169[39m, in [36m_assert_all_finite_element_wise[39m[34m(X, xp, allow_nan, msg_dtype, estimator_name, input_name)[39m
+[32m    152[39m [38;5;28;01mif[39;00m estimator_name [38;5;129;01mand[39;00m input_name == [33m"[39m[33mX[39m[33m"[39m [38;5;129;01mand[39;00m has_nan_error:
+[32m    153[39m     [38;5;66;03m# Improve the error message on how to handle missing values in[39;00m
+[32m    154[39m     [38;5;66;03m# scikit-learn.[39;00m
+[32m    155[39m     msg_err += (
+[32m    156[39m         [33mf[39m[33m"[39m[38;5;130;01m\n[39;00m[38;5;132;01m{[39;00mestimator_name[38;5;132;01m}[39;00m[33m does not accept missing values[39m[33m"[39m
+[32m    157[39m         [33m"[39m[33m encoded as NaN natively. For supervised learning, you might want[39m[33m"[39m
+[32m   (...)[39m[32m    167[39m         [33m"[39m[33m#estimators-that-handle-nan-values[39m[33m"[39m
+[32m    168[39m     )
+[32m--> [39m[32m169[39m [38;5;28;01mraise[39;00m [38;5;167;01mValueError[39;00m(msg_err)
+
+[31mValueError[39m: Input y contains infinity or a value too large for dtype('float64').
+

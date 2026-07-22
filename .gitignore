@@ -1,0 +1,20 @@
+# --- python ---
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- build artifacts ---
+build/
+dist/
+scratch/
+
+# --- LARGE DATA: never commit (this is the 19GB) ---
+backtest_engine2/data/
+backtest_engine2/data_cache/
+data_cache/
+*.parquet
+*.h5
+*.pkl
+*.feather

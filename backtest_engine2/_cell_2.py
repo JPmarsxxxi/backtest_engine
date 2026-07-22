@@ -1,0 +1,538 @@
+# Cell 3 â€” CryptoRegimeOuTrendStrategy
+# Layer 1: BTC DVOL expanding-percentile macro gate (regime OFF â†’ close all, block entries)
+# Layer 2: OuTrendPullbackStrategy (trend+pullback entry, ABM/GBM OU-optimal exit, per-asset CPD)
+
+import os, subprocess, sys, time
+from pathlib import Path
+
+try:
+    from numba import njit, prange
+    HAS_NUMBA = True
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "numba"])
+    from numba import njit, prange
+    HAS_NUMBA = True
+
+N_CORES = os.cpu_count() or 8
+os.environ["NUMBA_NUM_THREADS"] = str(N_CORES)
+os.environ.setdefault("OMP_NUM_THREADS", str(N_CORES))
+
+import numpy as np
+import pandas as pd
+from backtest.strategy import Strategy
+from backtest.risk.config import RiskConfig
+from _mood_helpers_ou_optimal_trend_pullback import _mood_d_max_tau, MOOD_THRESHOLD
+
+_FAST  = FAST_MODE
+_NUM_PATHS  = 10_000 if _FAST else 100_000
+_MAX_HOLD   = 72
+_OLS_WINDOW = 168
+_MAX_POSITIONS           = 10
+_WEIGHT_PER_POSITION     = 0.05
+_MAX_NEW_ENTRIES_PER_BAR = 3
+_MIN_PI_WIDTH        = 5.0
+_SIGMA_PERCENTILE    = 0.75
+_PI_PLUS_GRID  = np.arange(0.5,  10.0 + 0.5 * 0.5, 0.5, dtype=np.float64)
+_PI_MINUS_GRID = np.arange(-10.0, -0.5 + 0.5 * 0.5, 0.5, dtype=np.float64)
+
+# â”€â”€ Numba JIT functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@njit(cache=True)
+def _fit_ou_numba(s, m):
+    n = len(s)
+    if n < 10: return np.nan, np.nan
+    y = np.empty(n - 1); x = np.empty(n - 1)
+    for i in range(n - 1): y[i] = s[i+1] - s[i]; x[i] = s[i] - m
+    mx = 0.0; my = 0.0
+    for i in range(n - 1): mx += x[i]; my += y[i]
+    mx /= n-1; my /= n-1
+    var_x = 0.0; cov_xy = 0.0
+    for i in range(n - 1):
+        dx = x[i]-mx; dy = y[i]-my
+        var_x += dx*dx; cov_xy += dx*dy
+    if n-1 > 1: var_x /= n-2; cov_xy /= n-2
+    if var_x < 1e-14: return np.nan, np.nan
+    phi = 1.0 + cov_xy / var_x
+    ss = 0.0
+    for i in range(n - 1):
+        resid = y[i] - (phi - 1.0)*x[i]; ss += resid*resid
+    sigma = np.sqrt(ss/(n-2)) if n > 2 else np.nan
+    if not np.isfinite(phi) or not np.isfinite(sigma) or sigma <= 0.0: return np.nan, np.nan
+    if phi <= -1.0 or phi >= 1.0: return np.nan, np.nan
+    return phi, sigma
+
+@njit(cache=True)
+def _detect_trend_type(s):
+    n = len(s)
+    if n < 10: return 'abm'
+    x = np.arange(n, dtype=np.float64); mx = np.mean(x); ms = np.mean(s)
+    cov = 0.0; var_x = 0.0
+    for i in range(n):
+        dx = x[i]-mx; ds = s[i]-ms; cov += dx*ds; var_x += dx*dx
+    slope_linear = cov/var_x if var_x > 0 else 0.0
+    ss_res = 0.0; ss_tot = 0.0
+    for i in range(n):
+        pred = ms + slope_linear*(x[i]-mx)
+        ss_res += (s[i]-pred)**2; ss_tot += (s[i]-ms)**2
+    r2_linear = 1.0 - ss_res/ss_tot if ss_tot > 0 else 0.0
+    log_s = np.log(s); m_log = np.mean(log_s)
+    cov_log = 0.0
+    for i in range(n): cov_log += (x[i]-mx)*(log_s[i]-m_log)
+    slope_log = cov_log/var_x if var_x > 0 else 0.0
+    ss_res_log = 0.0; ss_tot_log = 0.0
+    for i in range(n):
+        pred_log = m_log + slope_log*(x[i]-mx)
+        ss_res_log += (log_s[i]-pred_log)**2; ss_tot_log += (log_s[i]-m_log)**2
+    r2_log = 1.0 - ss_res_log/ss_tot_log if ss_tot_log > 0 else 0.0
+    return 'gbm' if r2_log > r2_linear else 'abm'
+
+@njit(cache=True)
+def _fit_abm_numba(s):
+    n = len(s)
+    if n < 10: return np.nan, np.nan
+    deltas = np.empty(n-1)
+    for i in range(n-1): deltas[i] = s[i+1] - s[i]
+    mu = 0.0
+    for i in range(n-1): mu += deltas[i]
+    mu /= n-1
+    var = 0.0
+    for i in range(n-1): diff = deltas[i]-mu; var += diff*diff
+    sigma = np.sqrt(var/(n-2)) if n > 2 else np.nan
+    if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0.0: return np.nan, np.nan
+    return mu, sigma
+
+@njit(cache=True)
+def _fit_gbm_numba(s):
+    n = len(s)
+    if n < 10: return np.nan, np.nan
+    log_returns = np.empty(n-1)
+    for i in range(n-1):
+        if s[i] <= 0 or s[i+1] <= 0: return np.nan, np.nan
+        log_returns[i] = np.log(s[i+1]/s[i])
+    mu = 0.0
+    for i in range(n-1): mu += log_returns[i]
+    mu /= n-1
+    var = 0.0
+    for i in range(n-1): diff = log_returns[i]-mu; var += diff*diff
+    sigma = np.sqrt(var/(n-2)) if n > 2 else np.nan
+    if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0.0: return np.nan, np.nan
+    return mu, sigma
+
+@njit(parallel=True, cache=True)
+def _calibrate_trend_fused(mu, sigma, s0, n_paths, max_h, seed, pi_plus_grid, pi_minus_grid, model_type):
+    np.random.seed(seed & 0xFFFFFFFF)
+    n_steps = max_h + 1
+    pi_paths = np.empty((n_paths, n_steps))
+    for i in prange(n_paths):
+        si = s0; pi_paths[i, 0] = 0.0
+        for step in range(1, n_steps):
+            eps = np.random.randn()
+            if model_type == 0: si = si + mu + sigma*eps
+            else:               si = si * np.exp((mu - 0.5*sigma*sigma) + sigma*eps)
+            pi_paths[i, step] = si - s0
+    n_plus = pi_plus_grid.shape[0]; n_minus = pi_minus_grid.shape[0]
+    best_sharpe = -1.0e300; best_plus = pi_plus_grid[0]; best_minus = pi_minus_grid[0]
+    for ip in range(n_plus):
+        pi_p = pi_plus_grid[ip]
+        for im in range(n_minus):
+            pi_m = pi_minus_grid[im]
+            sum_p = 0.0; sum_sq = 0.0
+            for i in range(n_paths):
+                exit_idx = max_h
+                for j in range(1, n_steps):
+                    pi = pi_paths[i, j]
+                    if pi >= pi_p or pi <= pi_m: exit_idx = j; break
+                pnl = pi_paths[i, exit_idx]; sum_p += pnl; sum_sq += pnl*pnl
+            mean = sum_p/n_paths
+            var = (sum_sq - n_paths*mean*mean)/(n_paths-1) if n_paths > 1 else 0.0
+            if var < 1e-24: continue
+            sharpe = mean/np.sqrt(var)
+            if sharpe > best_sharpe: best_sharpe = sharpe; best_plus = pi_p; best_minus = pi_m
+    if best_sharpe <= -1.0e299: return np.nan, np.nan, np.nan
+    return best_plus, best_minus, best_sharpe
+
+# â”€â”€ GPU fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+_USE_GPU = os.environ.get("USE_GPU", "auto").lower()
+_cp = None; HAS_GPU = False
+
+def _try_init_gpu():
+    global _cp, HAS_GPU
+    if _USE_GPU == "false": return
+    try:
+        import cupy as cp
+    except ImportError:
+        if _USE_GPU == "true":
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "cupy-cuda12x"])
+            import cupy as cp
+        else: return
+    if cp.cuda.is_available(): _cp = cp; HAS_GPU = True
+
+_try_init_gpu()
+
+def _calibrate_trend_gpu(mu, sigma, s0, n_paths, max_h, seed, pi_plus_grid, pi_minus_grid, model_type):
+    cp = _cp; rng = cp.random.RandomState(seed & 0xFFFFFFFF)
+    n_paths = int(n_paths); max_h = int(max_h); n_steps = max_h + 1
+    eps = rng.standard_normal((n_paths, max_h), dtype=cp.float64)
+    pi_paths = cp.empty((n_paths, n_steps), dtype=cp.float64); pi_paths[:, 0] = 0.0
+    if model_type == 0:
+        cum_s = s0 + cp.cumsum(mu + sigma*eps, axis=1); pi_paths[:, 1:] = cum_s - s0
+    else:
+        log_inc = (mu - 0.5*sigma*sigma) + sigma*eps
+        cum_s = s0 * cp.exp(cp.cumsum(log_inc, axis=1)); pi_paths[:, 1:] = cum_s - s0
+    pi = pi_paths[:, 1:]; best_sharpe = -1.0e300
+    best_plus = float(pi_plus_grid[0]); best_minus = float(pi_minus_grid[0])
+    for pi_p in pi_plus_grid:
+        for pi_m in pi_minus_grid:
+            hit = (pi >= pi_p) | (pi <= pi_m); has_hit = hit.any(axis=1)
+            first_col = hit.argmax(axis=1)
+            exit_col = cp.where(has_hit, first_col+1, max_h)
+            pnl = pi_paths[cp.arange(n_paths), exit_col]
+            mean = pnl.mean(); var = pnl.var(ddof=1) if n_paths > 1 else cp.float64(0.0)
+            if float(var) < 1e-24: continue
+            sharpe = float(mean/cp.sqrt(var))
+            if sharpe > best_sharpe: best_sharpe = sharpe; best_plus = float(pi_p); best_minus = float(pi_m)
+    if best_sharpe <= -1.0e299: return np.nan, np.nan, np.nan
+    return best_plus, best_minus, best_sharpe
+
+# â”€â”€ OuTrendPullbackStrategy (base) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class OuTrendPullbackStrategy(Strategy):
+    """Trend + pullback entry + OU-optimal exit thresholds + per-asset CUSUM CPD."""
+    rebalance_frequency = "D"
+
+    def __init__(self, fast_mode=_FAST, num_simulated_paths=None, max_holding_period=_MAX_HOLD,
+                 ou_ols_window=_OLS_WINDOW, max_positions=_MAX_POSITIONS,
+                 weight_per_position=_WEIGHT_PER_POSITION, max_new_entries_per_bar=_MAX_NEW_ENTRIES_PER_BAR,
+                 pi_plus_grid=None, pi_minus_grid=None, min_pi_width=_MIN_PI_WIDTH,
+                 sigma_percentile=_SIGMA_PERCENTILE, mood_threshold=MOOD_THRESHOLD,
+                 mood_warmup=21, mood_cooldown=48):
+        self.fast_mode = fast_mode
+        self.num_simulated_paths = num_simulated_paths if num_simulated_paths is not None \
+            else (10_000 if fast_mode else 100_000)
+        self.max_holding_period = max_holding_period
+        self.ou_ols_window = ou_ols_window
+        self.max_positions = max_positions
+        self.weight_per_position = weight_per_position
+        self.max_new_entries_per_bar = max_new_entries_per_bar
+        self._pi_plus_grid  = pi_plus_grid  if pi_plus_grid  is not None else _PI_PLUS_GRID.copy()
+        self._pi_minus_grid = pi_minus_grid if pi_minus_grid is not None else _PI_MINUS_GRID.copy()
+        self.min_pi_width = min_pi_width
+        self.sigma_percentile = sigma_percentile
+        self.mood_threshold = mood_threshold
+        self.mood_warmup = mood_warmup
+        self.mood_cooldown = mood_cooldown
+        self.open_trades: dict = {}
+        self.trade_log: list = []
+        self.decision_log: list = []
+        self._event_this_bar = False
+        self._n_entries = 0; self._n_exits = 0; self._n_ou_skipped = 0
+        self._mood_buffers: dict = {}; self._last_changepoint: dict = {}
+
+    def __repr__(self):
+        return (f"OuTrendPullbackStrategy(fast={self.fast_mode},paths={self.num_simulated_paths},"
+                f"hold={self.max_holding_period},ols={self.ou_ols_window},"
+                f"maxpos={self.max_positions},w={self.weight_per_position})")
+
+    def required_data(self):
+        return {"prices": None, "volume": None, "entry_signal": None}
+
+    def _log_decision(self, decision, t, asset, **fields):
+        row = {"decision": decision, "t": t, "asset": asset}; row.update(fields)
+        self.decision_log.append(row)
+
+    def _check_mood_regime(self, asset, log_ret, t):
+        if asset not in self._mood_buffers: self._mood_buffers[asset] = []
+        self._mood_buffers[asset].append(log_ret)
+        t = pd.Timestamp(t)
+        if (asset in self._last_changepoint and
+                (t - self._last_changepoint[asset]) < pd.Timedelta(hours=self.mood_cooldown)):
+            return False
+        if len(self._mood_buffers[asset]) <= self.mood_warmup: return True
+        if len(self._mood_buffers[asset]) > 500:
+            self._mood_buffers[asset] = self._mood_buffers[asset][-500:]
+        buf_arr = np.array(self._mood_buffers[asset], dtype=np.float64)
+        dmax, tau = _mood_d_max_tau(buf_arr, len(buf_arr))
+        if dmax > self.mood_threshold:
+            self._last_changepoint[asset] = t
+            self._mood_buffers[asset] = self._mood_buffers[asset][int(tau):]
+            return False
+        return True
+
+    def _entry_context(self, data, asset):
+        ctx = {}
+        for name in ("entry_signal", "trend_up", "pullback", "recent_down", "roll_trend", "log_returns"):
+            try:
+                f = data.feature(name).iloc[-1]
+                if asset in f.index:
+                    v = f[asset]
+                    if np.isfinite(v): ctx[name] = float(v)
+            except (KeyError, AttributeError, TypeError): pass
+        return ctx
+
+    @staticmethod
+    def _fit_trend(prices):
+        if not HAS_NUMBA:
+            s = np.asarray(prices, dtype=float)
+            if len(s) < 10 or np.isnan(s).any() or np.any(s <= 0): return None
+            deltas = np.diff(s); mu = float(np.mean(deltas)); sigma = float(np.std(deltas, ddof=1))
+            if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0: return None
+            return 'abm', mu, sigma
+        s = prices.astype(np.float64)
+        mtype = _detect_trend_type(s)
+        result = _fit_gbm_numba(s) if mtype == 'gbm' else _fit_abm_numba(s)
+        if result is None or np.isnan(result[0]) or np.isnan(result[1]): return None
+        return mtype, float(result[0]), float(result[1])
+
+    def _calibrate_thresholds(self, model_type_str, mu, sigma, p0, seed):
+        mt = 1 if model_type_str == "gbm" else 0
+        args = (float(mu), float(sigma), float(p0), int(self.num_simulated_paths),
+                int(self.max_holding_period), int(seed), self._pi_plus_grid, self._pi_minus_grid, mt)
+        if HAS_GPU: return _calibrate_trend_gpu(*args)
+        if not HAS_NUMBA: raise RuntimeError("Numba or GPU required")
+        return _calibrate_trend_fused(*args)
+
+    def _try_enter(self, asset, prices, t, ctx=None):
+        ctx = dict(ctx or {})
+        log_ret = ctx.get("log_returns", np.nan)
+        if np.isfinite(log_ret):
+            if not self._check_mood_regime(asset, log_ret, t):
+                self._n_ou_skipped += 1
+                self._log_decision("entry_reject", t, asset, reason="regime_changepoint", **ctx)
+                return False
+        hist = prices[asset].dropna()
+        if len(hist) < self.ou_ols_window:
+            self._n_ou_skipped += 1
+            self._log_decision("entry_reject", t, asset, reason="short_history",
+                               hist_len=int(len(hist)), need=self.ou_ols_window, **ctx)
+            return False
+        window = hist.iloc[-self.ou_ols_window:]; p0 = float(window.iloc[-1])
+        trend_fit = self._fit_trend(window.values)
+        if trend_fit is None:
+            self._n_ou_skipped += 1
+            self._log_decision("entry_reject", t, asset, reason="trend_fit_fail", p0=p0, **ctx)
+            return False
+        model_type, mu, sigma = trend_fit
+        if mu <= 0:
+            self._n_ou_skipped += 1
+            self._log_decision("entry_reject", t, asset, reason="negative_drift",
+                               mu=float(mu), model_type=model_type, **ctx)
+            return False
+        snr = mu/sigma if sigma > 0 else 0
+        if snr < 0.05:
+            self._n_ou_skipped += 1
+            self._log_decision("entry_reject", t, asset, reason="low_signal_to_noise",
+                               snr=float(snr), mu=float(mu), sigma=float(sigma),
+                               model_type=model_type, **ctx)
+            return False
+        window_sigmas = []
+        hist_available = len(hist)
+        for i in range(max(self.ou_ols_window, hist_available - 500), hist_available, 20):
+            if i < self.ou_ols_window: continue
+            mini = hist.iloc[i - self.ou_ols_window: i]
+            if len(mini) >= self.ou_ols_window:
+                ft = self._fit_trend(mini.values)
+                if ft is not None: window_sigmas.append(ft[2])
+        if len(window_sigmas) >= 10:
+            sig_thresh = float(np.percentile(window_sigmas, 75))
+            if sigma > sig_thresh:
+                self._n_ou_skipped += 1
+                self._log_decision("entry_reject", t, asset, reason="sigma_too_high",
+                                   sigma=float(sigma), threshold=sig_thresh,
+                                   n_samples=len(window_sigmas), model_type=model_type, **ctx)
+                return False
+        seed = hash((asset, str(t))) % (2**32)
+        cal = self._calibrate_thresholds(model_type, mu, sigma, p0, seed)
+        pi_plus, pi_minus, ou_sharpe = cal
+        if not (np.isfinite(pi_plus) and np.isfinite(pi_minus) and np.isfinite(ou_sharpe)):
+            self._n_ou_skipped += 1
+            self._log_decision("entry_reject", t, asset, reason="ou_calibrate_fail",
+                               p0=p0, model_type=model_type, mu=float(mu), sigma=float(sigma), **ctx)
+            return False
+        if ou_sharpe < 0.0:
+            self._n_ou_skipped += 1
+            self._log_decision("entry_reject", t, asset, reason="ou_sharpe_too_low",
+                               ou_sharpe=float(ou_sharpe), **ctx)
+            return False
+        pi_width = pi_plus - pi_minus
+        if pi_width < self.min_pi_width:
+            self._n_ou_skipped += 1
+            self._log_decision("entry_reject", t, asset, reason="corridor_too_tight",
+                               pi_width=float(pi_width), min_required=self.min_pi_width,
+                               pi_plus=float(pi_plus), pi_minus=float(pi_minus), **ctx)
+            return False
+        trade = {"entry_t": t, "p0": p0, "model_type": model_type, "mu": float(mu),
+                 "sigma": float(sigma), "pi_plus": float(pi_plus), "pi_minus": float(pi_minus),
+                 "ou_sharpe": float(ou_sharpe), "bars_held": 0, "entry_ctx": ctx}
+        self.open_trades[asset] = trade
+        self._n_entries += 1; self._event_this_bar = True
+        self._log_decision("entry_open", t, asset, reason="accepted", p0=p0,
+                           model_type=model_type, mu=float(mu), sigma=float(sigma),
+                           snr=float(snr), pi_plus=float(pi_plus), pi_minus=float(pi_minus),
+                           pi_width=float(pi_width), ou_sharpe=float(ou_sharpe),
+                           weight=self.weight_per_position, **ctx)
+        return True
+
+    def generate_weights(self, data, t):
+        self._event_this_bar = False
+        prices = data.prices
+        entry_row = data.feature("entry_signal").iloc[-1]
+        eligible = set(data.assets)
+        weights = pd.Series(0.0, index=prices.columns)
+        for asset in list(self.open_trades.keys()):
+            if asset not in eligible:
+                weights[asset] = self.weight_per_position; continue
+            col = prices[asset] if asset in prices.columns else None
+            if col is None or col.empty:
+                weights[asset] = self.weight_per_position; continue
+            p = float(col.iloc[-1])
+            if not np.isfinite(p):
+                weights[asset] = self.weight_per_position; continue
+            trade = self.open_trades[asset]; trade["bars_held"] += 1
+            pi_t = float(p) - trade["p0"]
+            timeout_limit = 48 if trade.get("ou_sharpe", 0) < 0.0 else self.max_holding_period
+            exit_now = pi_t >= trade["pi_plus"] or pi_t <= trade["pi_minus"] \
+                       or trade["bars_held"] >= timeout_limit
+            if exit_now:
+                reason = ("pi_plus" if pi_t >= trade["pi_plus"]
+                          else "pi_minus" if pi_t <= trade["pi_minus"] else "timeout")
+                ret_pct = pi_t / trade["p0"] if trade["p0"] else np.nan
+                self.trade_log.append({
+                    "asset": asset, "entry_t": trade["entry_t"], "exit_t": t,
+                    "bars_held": trade["bars_held"], "p0": trade["p0"], "p_exit": float(p),
+                    "model_type": trade["model_type"], "mu": trade["mu"], "pi_exit": pi_t,
+                    "ret_pct": float(ret_pct), "win": bool(pi_t > 0), "exit_reason": reason,
+                    "sigma": trade["sigma"], "pi_plus": trade["pi_plus"],
+                    "pi_minus": trade["pi_minus"], "ou_sharpe": trade["ou_sharpe"],
+                    "entry_ctx": trade.get("entry_ctx"),
+                })
+                self._log_decision("exit", t, asset, reason=reason, p_exit=float(p),
+                                   pi_exit=pi_t, ret_pct=float(ret_pct), win=bool(pi_t > 0),
+                                   bars_held=trade["bars_held"], pi_plus=trade["pi_plus"],
+                                   pi_minus=trade["pi_minus"],
+                                   **(trade.get("entry_ctx") or {}))
+                del self.open_trades[asset]; self._n_exits += 1; self._event_this_bar = True
+            else:
+                weights[asset] = self.weight_per_position
+        new_entries = 0
+        for asset in eligible:
+            if asset in self.open_trades: continue
+            sig_val = float(entry_row.get(asset, 0.0)) if asset in entry_row.index else 0.0
+            if not (np.isfinite(sig_val) and sig_val > 0.5): continue
+            ctx = self._entry_context(data, asset)
+            if len(self.open_trades) >= self.max_positions:
+                self._log_decision("entry_reject", t, asset, reason="max_positions",
+                                   n_open=len(self.open_trades), cap=self.max_positions, **ctx)
+                continue
+            if new_entries >= self.max_new_entries_per_bar:
+                self._log_decision("entry_reject", t, asset, reason="max_new_per_bar",
+                                   cap=self.max_new_entries_per_bar, **ctx)
+                continue
+            if self._try_enter(asset, prices, t, ctx):
+                weights[asset] = self.weight_per_position; new_entries += 1
+        return weights
+
+    def apply_risk(self, proposed, state, data):
+        equity = state["equity"]
+        if not self._event_this_bar and equity > 0:
+            proposed = state["positions"] / equity
+        return super().apply_risk(proposed, state, data)
+
+
+# â”€â”€ CryptoRegimeOuTrendStrategy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class CryptoRegimeOuTrendStrategy(OuTrendPullbackStrategy):
+    """
+    OuTrendPullbackStrategy gated by a BTC DVOL expanding-percentile macro regime filter.
+    DVOL > expanding P(dvol_percentile) of all DVOL seen so far â†’ regime OFF: close all
+    positions immediately and block new entries until DVOL falls back below the threshold.
+    """
+    rebalance_frequency = "D"
+    risk = RiskConfig(max_position=None, max_gross=1.0, max_net=1.0)
+
+    def __init__(self, dvol_percentile=DVOL_PERCENTILE, dvol_warmup=DVOL_WARMUP_BARS, **kwargs):
+        super().__init__(**kwargs)
+        self.dvol_percentile = dvol_percentile
+        self.dvol_warmup     = dvol_warmup
+        self._dvol_hist: list = []   # grows bar-by-bar; PIT-safe expanding history
+
+    def __repr__(self):
+        return (f"CryptoRegimeOuTrendStrategy("
+                f"dvol_pct={self.dvol_percentile}, dvol_warmup={self.dvol_warmup}, "
+                f"fast={self.fast_mode}, paths={self.num_simulated_paths}, "
+                f"hold={self.max_holding_period}, ols={self.ou_ols_window}, "
+                f"maxpos={self.max_positions}, w={self.weight_per_position})")
+
+    def required_data(self):
+        return {**super().required_data(), "DVOL": None}
+
+    def _close_all_for_regime_off(self, prices, t):
+        for asset in list(self.open_trades.keys()):
+            trade = self.open_trades[asset]
+            if asset in prices.columns and not prices[asset].empty:
+                p = float(prices[asset].iloc[-1])
+            else:
+                p = trade["p0"]
+            if not np.isfinite(p):
+                p = trade["p0"]
+            pi_t    = p - trade["p0"]
+            ret_pct = pi_t / trade["p0"] if trade["p0"] else np.nan
+            self.trade_log.append({
+                "asset": asset, "entry_t": trade["entry_t"], "exit_t": t,
+                "bars_held": trade.get("bars_held", 0), "p0": trade["p0"], "p_exit": p,
+                "model_type": trade.get("model_type", "unknown"), "mu": trade.get("mu", np.nan),
+                "pi_exit": pi_t, "ret_pct": float(ret_pct), "win": bool(pi_t > 0),
+                "exit_reason": "regime_off", "sigma": trade.get("sigma", np.nan),
+                "pi_plus": trade.get("pi_plus", np.nan), "pi_minus": trade.get("pi_minus", np.nan),
+                "ou_sharpe": trade.get("ou_sharpe", np.nan), "entry_ctx": trade.get("entry_ctx"),
+            })
+            self._log_decision("exit", t, asset, reason="regime_off", p_exit=p,
+                               pi_exit=pi_t, ret_pct=float(ret_pct), win=bool(pi_t > 0),
+                               bars_held=trade.get("bars_held", 0))
+            del self.open_trades[asset]
+            self._n_exits += 1
+
+    def generate_weights(self, data, t):
+        self._event_this_bar = False
+
+        # â”€â”€ Macro regime gate (Layer 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        dvol_row     = data.feature("DVOL").iloc[-1]
+        current_dvol = float(dvol_row.iloc[0]) if len(dvol_row) > 0 else np.nan
+
+        if np.isfinite(current_dvol):
+            self._dvol_hist.append(current_dvol)
+
+        if len(self._dvol_hist) >= self.dvol_warmup and np.isfinite(current_dvol):
+            expanding_threshold = float(np.percentile(self._dvol_hist, self.dvol_percentile))
+            regime_off = current_dvol > expanding_threshold
+        else:
+            regime_off = False   # still in warmup â€” allow trading
+
+        if regime_off:
+            if self.open_trades:
+                self._close_all_for_regime_off(data.prices, t)
+            self._event_this_bar = True   # bypass hold-positions logic in apply_risk
+            return pd.Series(0.0, index=data.prices.columns)
+
+        # â”€â”€ Regime ON: delegate to OU trend+pullback layer (Layer 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        return super().generate_weights(data, t)
+
+
+# â”€â”€ Instantiate + validate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+strat = CryptoRegimeOuTrendStrategy()
+print(strat)
+print(f"\nrequired_data : {strat.required_data()}")
+
+rb = strat.rebalance_dates(panel.dates)
+print(f"Rebalance bars: {len(rb):,}  (every hourly bar â€” 'D' = every bar in dates)")
+print(f"Rebalances/day: {len(rb) / (len(panel.dates) / 24):.1f}")
+print(f"\nNumba : {HAS_NUMBA}   GPU : {HAS_GPU}   Cores : {N_CORES}")
+print(f"Paths : {strat.num_simulated_paths:,}   Grid : "
+      f"{len(strat._pi_plus_grid)}Ã—{len(strat._pi_minus_grid)} = "
+      f"{len(strat._pi_plus_grid)*len(strat._pi_minus_grid)} nodes")
+print(f"\nDVOL gate : pct={strat.dvol_percentile}  warmup={strat.dvol_warmup} bars")
+
+# Numba warmup (JIT compile)
+print("\nWarming up Numba JIT (first call compiles; cache=True means once only) â€¦")
+_t0 = time.perf_counter()
+_ = _calibrate_trend_fused(0.5, 0.01, 100.0, 100, 10, 42, _PI_PLUS_GRID[:3], _PI_MINUS_GRID[:3], 0)
+print(f"Done in {time.perf_counter()-_t0:.1f}s")

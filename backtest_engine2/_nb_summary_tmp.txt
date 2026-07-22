@@ -1,0 +1,77 @@
+===== crypto_ml_factor.ipynb =====
+# Crypto ML Factor Cross-Section Backtest
+**Strategy:** `crypto-ml-factor-cross-section`  
+**Paper:** *Predicting Cryptocurrency Returns with Machine Learning*  
+**Universe:** CoinGecko top-150 coins by market cap (dynamic, stablecoins excluded, ? $10M filter applied weekly)  
+**Data sources:** CoinGecko (price/volume/mcap ? cached) ? Coin Metrics community (on-chain) ? yfinance (macro) ? Fama-Fre
+
+===== crypto_regime_ou_trend.ipynb =====
+
+===== crypto_swapdodge.ipynb =====
+# Crypto swap-dodge test (#006 momentum)
+
+Does closing before the daily rollover (flat ~minutes) and reopening dodge the FTMO 30%/side crypto swap?
+Daily-bar cost-config comparison: **hold-through (pay swap)** vs **close+reopen (pay daily round-trip churn, no swap)** vs **swap-free ceiling**.
+Base alpha = #006 crypto 30d XS momentum. PIT research universe (top-30 by trailing 30d $-volume) + FTMO-d
+
+===== hurst_optimal_exit_pairs.ipynb =====
+
+===== hurst_pairs_crypto.ipynb =====
+
+===== intraday_mom_us500.ipynb =====
+
+===== intraday_tsm_btc.ipynb =====
+
+===== opening_range_breakout.ipynb =====
+
+===== ou_optimal_trend_pullback.ipynb =====
+
+===== overnight_drift_us500.ipynb =====
+
+===== pmm_strategy.ipynb =====
+
+===== pmm_strategy_crypto2.ipynb =====
+# PMM-style strategy ? **crypto universe**
+
+Same mathematical pipeline as `pmm_strategy.ipynb` (RPM, vol targeting, PMM/PMMC), with **crypto data** replacing Kenneth French deciles and FF factors.
+
+**Data source:** [Binance](https://www.binance.com) spot market via **`ccxt`** (public OHLCV; API keys only if you later add private endpoints). Yahoo / `yfinance` is not used.
+
+Constants and bar conven
+
+===== reversal_alpha_ftmo_universe.ipynb =====
+
+===== skew_lottery_crypto.ipynb =====
+
+===== statarb_027.ipynb =====
+
+===== synth_edge_momentum.ipynb =====
+
+===== trend_following_gold.ipynb =====
+
+===== tsmom_ftmo.ipynb =====
+
+===== vix_change_point.ipynb =====
+
+===== vix_change_point_opt.ipynb =====
+
+===== experiments\2026-06-02_hurst_pairs.ipynb =====
+# Hurst Pairs Alpha Hunt ? 2026-06-02
+
+**Hypothesis** (from `strategy_engine2/output/hurst-optimal-exit-pairs/spec.json`): when a crypto pair's log-spread is anti-persistent (local generalized Hurst `H < 0.5`) and the spread sits 1-2? from its rolling mean, the spread mean-reverts fast. Per-trade O-U fit calibrates profit-take and stop-loss thresholds; 72h vertical barrier.
+
+**Framing** (option C)
+## Cell 1 ? Stage 1: Universe + data load
+
+Skill: `backtest_engine2/skills/13-universe.md`. Load the long-format parquet, pivot to wide date?asset frames, drop pegged tokens, build the top-50 point-in-time mask via 30-day trailing dollar ADV.
+
+===== notebooks\overnight_rf\overnight_rf.ipynb =====
+# overnight_rf ? RF classifier: P(US500 overnight move > 0)
+
+Spec (2026-07-17, discussed before any code ? see PROTOCOL.md):
+- **Target:** does the overnight window close green? Binary, one obs per night.
+- **Model:** random forest, chronological train/val/test, purged boundaries, SHAP at the end.
+- **Discipline:** data-hygiene.md provenance line per data source; features strictly entry-knowable
+ 
+
+===== notebooks\reversal_alpha\reversal_alpha.ipynb =====

@@ -1,0 +1,289 @@
+########################################################################
+# CELL 0 — setup: install engine wheel + yfinance
+# Needs: dataset "backtest-engine-wheel" attached (Add Input -> Your Datasets)
+#        Internet enabled (Notebook options -> Internet: On)
+########################################################################
+
+!pip install -q /kaggle/input/datasets/isijolajesupelumi/backtest-engine-wheel/backtest-0.1.0-py3-none-any.whl yfinance
+
+import backtest
+print("backtest imported from:", backtest.__file__)
+
+
+########################################################################
+# CELL 1 — data load: all spec tickers, max history, DataPanel
+########################################################################
+
+import pandas as pd
+import yfinance as yf
+from backtest.data import DataPanel
+
+TICKERS = ["GLD", "GDX", "SLV", "GDXJ", "EWA", "EWC", "KO", "PEP", "USO", "BNO"]
+
+raw = yf.download(TICKERS, start="2004-11-18", auto_adjust=True, progress=False)
+prices = raw["Close"][TICKERS]
+volume = raw["Volume"][TICKERS]
+
+if prices.index.tz is not None:
+    prices.index = prices.index.tz_localize(None)
+    volume.index = volume.index.tz_localize(None)
+
+panel = DataPanel(prices, volume=volume, check_outliers=True)
+
+print(f"Bars: {len(panel.dates)}")
+print(f"Assets: {len(panel.assets_all)} -> {list(panel.assets_all)}")
+print(f"Range: {panel.dates[0].date()} -> {panel.dates[-1].date()}")
+print(f"NaN fraction in prices: {prices.isna().mean().mean():.3%}")
+print("First valid date per asset:")
+print(prices.apply(lambda s: s.first_valid_index().date()))
+prices.tail(3)
+
+
+########################################################################
+# CELL 2 — strategy: OU spread optimal double-stopping w/ stop-loss
+# (Leung & Li). Monthly refit on trailing 200 bars, hedge ratio scanned
+# by OU MLE, thresholds frozen per trade, buy-and-hold replication via
+# apply_risk. Trades GLD/GDX (trial 1).
+########################################################################
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import quad
+from scipy.optimize import brentq
+from backtest.strategy import Strategy
+from backtest.risk import RiskConfig
+
+
+def ou_mle(x, dt):
+    """Exact OU MLE on a series x sampled at dt (paper eq 2.2).
+    Returns (avg_loglik, mu, theta, sigma) or None if fit invalid."""
+    n = len(x) - 1
+    if n < 10:
+        return None
+    xa, xb = x[:-1], x[1:]
+    Sx, Sy = xa.sum(), xb.sum()
+    Sxx, Sxy = xa @ xa, xa @ xb
+    den = n * (Sxx - Sxy) - (Sx**2 - Sx * Sy)
+    if abs(den) < 1e-14:
+        return None
+    theta = (Sy * Sxx - Sx * Sxy) / den
+    num = Sxy - theta * (Sx + Sy) + n * theta**2
+    dnm = Sxx - 2 * theta * Sx + n * theta**2
+    if dnm <= 0:
+        return None
+    phi = num / dnm                      # = exp(-mu*dt)
+    if not (0.0 < phi < 1.0):
+        return None
+    mu = -np.log(phi) / dt
+    resid = xb - theta - phi * (xa - theta)
+    s2_eps = (resid @ resid) / n         # conditional variance
+    if s2_eps <= 0:
+        return None
+    sigma = np.sqrt(s2_eps * 2 * mu / (1 - phi**2))
+    ll = -0.5 * np.log(2 * np.pi) - 0.5 * np.log(s2_eps) - (resid @ resid) / (2 * n * s2_eps)
+    return ll, mu, theta, sigma
+
+
+class OUSpreadDoubleStopping(Strategy):
+    """Long a1 / short B*a2 OU spread; enter when X in [aL,dL], exit at
+    take-profit bL or stop-loss L (Leung & Li optimal double stopping)."""
+
+    rebalance_frequency = "daily"
+    risk = RiskConfig(max_position=1.0, max_gross=1.0, max_net=1.0)
+
+    def __init__(self, asset1, asset2, window=200, r=0.05, r_hat=0.05,
+                 c=0.05, c_hat=0.05, stop_z=2.0, scan_step=0.001,
+                 dt=1 / 252, gross=1.0):
+        self.asset1, self.asset2 = asset1, asset2
+        self.window = window
+        self.r, self.r_hat = r, r_hat
+        self.c, self.c_hat = c, c_hat
+        self.stop_z = stop_z
+        self.scan_step = scan_step
+        self.dt = dt
+        self.gross = gross
+        # run state (fresh per path: multi-path deepcopies the instance)
+        self._fit_ym = None          # (year, month) of last refit
+        self._fit = None             # dict: p10 p20 B mu theta sigma ll thresholds
+        self._trade = None           # frozen at entry: p10 p20 B bL L
+        self._action = "flat"        # set by generate_weights, read by apply_risk
+        self.n_fits = 0
+        self.n_fit_failures = 0
+
+    def __repr__(self):
+        return (f"OUSpreadDoubleStopping(asset1={self.asset1!r}, asset2={self.asset2!r}, "
+                f"window={self.window}, r={self.r}, r_hat={self.r_hat}, c={self.c}, "
+                f"c_hat={self.c_hat}, stop_z={self.stop_z}, scan_step={self.scan_step}, "
+                f"dt={self.dt:.6f}, gross={self.gross})")
+
+    # ---------- OU spread fitting ----------
+
+    def _refit(self, win):
+        """Fit B and (mu, theta, sigma) on a window DataFrame [a1, a2]; solve thresholds."""
+        self.n_fits += 1
+        p10, p20 = float(win[self.asset1].iloc[0]), float(win[self.asset2].iloc[0])
+        s1 = (win[self.asset1] / p10).to_numpy()
+        s2 = (win[self.asset2] / p20).to_numpy()
+        best = None
+        for B in np.arange(self.scan_step, 1.0 + 1e-12, self.scan_step):
+            out = ou_mle(s1 - B * s2, self.dt)
+            if out is not None and (best is None or out[0] > best[0]):
+                best = (*out, B)
+        if best is None:
+            self._fit = None
+            self.n_fit_failures += 1
+            return
+        ll, mu, theta, sigma, B = best
+        thr = self._solve_thresholds(mu, theta, sigma)
+        if thr is None:
+            self.n_fit_failures += 1
+        self._fit = dict(p10=p10, p20=p20, B=B, mu=mu, theta=theta,
+                         sigma=sigma, ll=ll, thresholds=thr)
+
+    # ---------- threshold solver (paper Sec. 5; r_hat==r so F_hat==F) ----------
+
+    def _solve_thresholds(self, mu, theta, sigma):
+        """Solve stop-loss L, take-profit bL (eq 5.5), entry [aL, dL]
+        (eqs 5.15-5.16). Returns dict or None (=> no-trade, eq 5.11)."""
+        r, c, ch = self.r, self.c, self.c_hat
+        k = np.sqrt(2 * mu) / sigma
+        p = r / mu
+        sig_stat = sigma / np.sqrt(2 * mu)
+        L = theta - self.stop_z * sig_stat
+        L_bar = (mu * theta + r * c) / (mu + r)      # eq 4.1
+        if L >= L_bar:                               # delay region vanishes
+            return None
+
+        def FG(x, sgn):      # F (sgn=+1) / G (sgn=-1), eqs 3.3-3.4
+            f = lambda u: u ** (p - 1.0) * np.exp(sgn * k * (x - theta) * u - 0.5 * u * u)
+            return quad(f, 0.0, 1.0)[0] + quad(f, 1.0, np.inf)[0]
+
+        def FGp(x, sgn):     # derivative wrt x
+            f = lambda u: u ** p * np.exp(sgn * k * (x - theta) * u - 0.5 * u * u)
+            return sgn * k * (quad(f, 0.0, 1.0)[0] + quad(f, 1.0, np.inf)[0])
+
+        F = lambda x: FG(x, +1.0)
+        G = lambda x: FG(x, -1.0)
+        Fp = lambda x: FGp(x, +1.0)
+        Gp = lambda x: FGp(x, -1.0)
+
+        FL, GL = F(L), G(L)
+
+        def psi_b(b):        # eq 5.5 residual, root = bL
+            return (((L - c) * G(b) - (b - c) * GL) * Fp(b)
+                    + ((b - c) * FL - (L - c) * F(b)) * Gp(b)
+                    - (G(b) * FL - GL * F(b)))
+
+        def bracket_root(fn, lo, hi, npts):
+            xs = np.linspace(lo, hi, npts)
+            vals = [fn(x) for x in xs]
+            for i in range(len(xs) - 1):
+                if np.isfinite(vals[i]) and np.isfinite(vals[i + 1]) and vals[i] * vals[i + 1] < 0:
+                    return brentq(fn, xs[i], xs[i + 1], xtol=1e-10)
+            return None
+
+        try:
+            bL = bracket_root(psi_b, max(L_bar, L + 1e-6), theta + 8 * sig_stat, 40)
+            if bL is None:
+                return None
+            den = F(bL) * GL - FL * G(bL)            # eq 5.4
+            if abs(den) < 1e-14:
+                return None
+            C = ((bL - c) * GL - (L - c) * G(bL)) / den
+            D = ((L - c) * F(bL) - (bL - c) * FL) / den
+            VL = lambda x: C * F(x) + D * G(x)       # eq 5.3, x in (L, bL)
+            VLp = lambda x: C * Fp(x) + D * Gp(x)
+
+            def phi_d(x):    # eq 5.16 residual, root = dL
+                return G(x) * (VLp(x) - 1.0) - Gp(x) * (VL(x) - x - ch)
+
+            def phi_a(x):    # eq 5.15 residual, root = aL
+                return F(x) * (VLp(x) - 1.0) - Fp(x) * (VL(x) - x - ch)
+
+            dL = bracket_root(phi_d, L + 1e-6, bL - 1e-6, 40)
+            if dL is None:
+                return None
+            aL = bracket_root(phi_a, L + 1e-6, dL - 1e-6, 40)
+            if aL is None:
+                return None
+            if not (L < aL < dL < bL):
+                return None
+            if VL(dL) - dL - ch <= 0:                # eq 5.11 non-trivial-trade
+                return None
+        except Exception:
+            return None
+        return dict(L=L, aL=aL, dL=dL, bL=bL, L_bar=L_bar)
+
+    # ---------- strategy contract ----------
+
+    @staticmethod
+    def _spread(px_row, p10, p20, B, a1, a2):
+        return float(px_row[a1]) / p10 - B * float(px_row[a2]) / p20
+
+    def generate_weights(self, data, t):
+        zeros = pd.Series(0.0, index=data.assets)
+        self._action = "flat"
+        px = data.prices[[self.asset1, self.asset2]].dropna()
+        if len(px) < self.window:
+            return zeros
+
+        ym = (t.year, t.month)
+        if self._fit_ym != ym:                       # monthly refit (new entries only)
+            self._refit(px.iloc[-self.window:])
+            self._fit_ym = ym
+
+        last = px.iloc[-1]
+
+        if self._trade is not None:                  # holding: frozen defs + lines
+            tr = self._trade
+            X = self._spread(last, tr["p10"], tr["p20"], tr["B"], self.asset1, self.asset2)
+            if X >= tr["bL"] or X <= tr["L"]:
+                self._trade = None                   # exit -> flat
+                return zeros
+            self._action = "hold"
+            return zeros                             # ignored: apply_risk holds position
+
+        f = self._fit
+        if f is None or f["thresholds"] is None:
+            return zeros
+        thr = f["thresholds"]
+        X = self._spread(last, f["p10"], f["p20"], f["B"], self.asset1, self.asset2)
+        if thr["aL"] <= X <= thr["dL"]:              # enter
+            B = f["B"]
+            w1 = self.gross / (1.0 + B)
+            w2 = -self.gross * B / (1.0 + B)
+            self._trade = dict(p10=f["p10"], p20=f["p20"], B=B,
+                               bL=thr["bL"], L=thr["L"])
+            self._action = "enter"
+            return pd.Series({self.asset1: w1, self.asset2: w2})
+        return zeros
+
+    def apply_risk(self, proposed, state, data):
+        if self._action == "hold":
+            eq = state["equity"]
+            if eq and eq > 0:
+                return state["positions"] / eq       # re-request drifted position -> ~zero trades
+        return super().apply_risk(proposed, state, data)
+
+
+strat = OUSpreadDoubleStopping("GLD", "GDX")
+print(strat)
+print(f"Rebalances/year: {len(strat.rebalance_dates(panel.dates)) / (len(panel.dates) / 252):.1f}")
+
+# smoke test: one refit on the most recent 200 GLD/GDX bars (diagnostic only)
+import time
+_win = prices[["GLD", "GDX"]].dropna().iloc[-200:]
+_t0 = time.time()
+strat._refit(_win)
+_f = strat._fit
+print(f"\nSmoke refit on {_win.index[0].date()} -> {_win.index[-1].date()}  ({time.time()-_t0:.1f}s)")
+if _f is None:
+    print("FIT FAILED")
+else:
+    hl = np.log(2) / _f["mu"] * 252
+    print(f"B={_f['B']:.3f}  mu={_f['mu']:.2f}  theta={_f['theta']:.4f}  "
+          f"sigma={_f['sigma']:.4f}  half-life={hl:.1f} bars  avg_ll={_f['ll']:.3f}")
+    print("thresholds:", {k: round(v, 4) for k, v in _f["thresholds"].items()}
+          if _f["thresholds"] else "None -> no-trade regime under current params")
+# reset run state so the smoke test can't leak into the real run
+strat = OUSpreadDoubleStopping("GLD", "GDX")

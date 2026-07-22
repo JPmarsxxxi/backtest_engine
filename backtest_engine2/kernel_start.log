@@ -1,0 +1,4 @@
+[KernelApp] Starting kernel 'python3'
+[KernelApp] Connection file: C:\Users\User\AppData\Roaming\jupyter\runtime\kernel-d25211b0-12fa-42c9-b06c-25ffce794541.json
+[KernelApp] To connect a client: --existing kernel-d25211b0-12fa-42c9-b06c-25ffce794541.json
+[IPKernelApp] WARNING | Parent appears to have exited, shutting down.
