@@ -1,4 +1,4 @@
-"""EDA#2 costs (Cell 3). Spread = max(FTMO x098 measured half-spread, EDGE estimate 21d, EDGE estimate 5d) per coin per bar;
+"""EDA#2 costs (Cell 3). Spread = max(FTMO x098 measured half-spread, Abdi-Ranaldo estimate 21d, 5d) per coin per bar;
 commission 3.25 bp/side; FTMO swap charged ONCE per night at the rollover with Friday triple (user decisions 2026-09-30)."""
 import numpy as np
 import pandas as pd
@@ -61,5 +61,8 @@ def daily_ohlc(hourly):
     return {k: pd.DataFrame(v) for k, v in out.items()}
 
 
-def edge_half_bps(d, window):
-    return ss.estimate(d["high"], d["low"], d["close"], open_=d["open"], method="edge", window=window)
+def ar_half_bps(d, window):
+    """Abdi-Ranaldo (2017) half-spread, bp. The engine's estimator uses the NEXT day's mid-range (eta.shift(-1)), so the raw
+    value labelled E is only known at E+1D. Shifted by one daily row: the value labelled E uses data up to E only."""
+    raw = ss.estimate(d["high"], d["low"], d["close"], method="abdi_ranaldo", window=window)
+    return raw.shift(1)
