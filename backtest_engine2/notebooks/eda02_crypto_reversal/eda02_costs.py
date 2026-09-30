@@ -1,10 +1,9 @@
-"""EDA#2 costs (Cell 3). Spread = max(FTMO x098 measured half-spread, Abdi-Ranaldo estimate 21d, 5d) per coin per bar;
+"""EDA#2 costs (Cell 3). Spread = max(FTMO x098 measured half-spread, MEASURED Binance half-spread by hour) per coin per bar;
 commission 3.25 bp/side; FTMO swap charged ONCE per night at the rollover with Friday triple (user decisions 2026-09-30)."""
 import numpy as np
 import pandas as pd
 
 from backtest.costs.base import CostModel
-from backtest.costs import spread_source as ss
 
 SWAP_ANNUAL = -0.30                 # FTMO crypto, both directions (x098 menu)
 NIGHT = 1.0 / 365.0                 # 8.22 bp per rollover at -30%/yr
@@ -45,24 +44,36 @@ class FTMOSwapNightly(CostModel):
         return float((-rate * pos.abs() * NIGHT * m).sum())
 
 
-def daily_ohlc(hourly):
-    """hourly: dict coin -> DataFrame[open, high, low, close] on bar-CLOSE stamps. Daily bars labelled by their END stamp
-    (00:00 UTC), complete days only (24 bars); incomplete days are NaN (never filled)."""
-    out = {k: {} for k in ["open", "high", "low", "close"]}
-    for c, df in hourly.items():
-        key = df.index.ceil("D")
-        g = df.groupby(key)
-        n = g["close"].count()
-        full = n >= 24
-        out["open"][c] = g["open"].first().where(full)
-        out["high"][c] = g["high"].max().where(full)
-        out["low"][c] = g["low"].min().where(full)
-        out["close"][c] = g["close"].last().where(full)
-    return {k: pd.DataFrame(v) for k, v in out.items()}
-
-
-def ar_half_bps(d, window):
-    """Abdi-Ranaldo (2017) half-spread, bp. The engine's estimator uses the NEXT day's mid-range (eta.shift(-1)), so the raw
-    value labelled E is only known at E+1D. Shifted by one daily row: the value labelled E uses data up to E only."""
-    raw = ss.estimate(d["high"], d["low"], d["close"], method="abdi_ranaldo", window=window)
-    return raw.shift(1)
+def measured_half_frames(quotes, index, floor):
+    """MEASURED spread (Tardis Binance quotes, 1st of each month) -> two hourly charged half-spread frames (bp).
+    For each coin and bar-close stamp t:
+      level  = the most recent sampled day that had fully ENDED by t (1st 00:00 -> 2nd 00:00): its median (low) or
+               90th percentile (high) of per-minute time-weighted half-spread
+      ratio  = hour-of-day shape from sampled days ended by t: median over days of (hour median / day median),
+               evaluated at t's hour (the fill happens at t, inside hour t.hour)
+      charged = max(FTMO floor, level x ratio)
+    Before the first sampled day has ended (all of 2018, early 2019) the FIRST sampled day stands in: a cost
+    ASSUMPTION using later data, never a signal input (flagged)."""
+    low, high = {}, {}
+    for c, q in quotes.items():
+        q = q.copy()
+        q["day"] = q["t"].dt.floor("D")
+        q["hour"] = q["t"].dt.hour
+        days = sorted(q["day"].unique())
+        lev = q.groupby("day")["half_bp_tw"].agg(med="median", p90=lambda x: x.quantile(0.9))
+        hm = q.groupby(["day", "hour"])["half_bp_tw"].median().unstack()
+        rel = hm.div(lev["med"], axis=0)                       # per-day hour shape
+        known = pd.DatetimeIndex(days) + pd.Timedelta("1D")    # a sampled day is known once it has ended
+        prof = rel.expanding().median()                        # shape from days up to and including row k
+        prof.index = known
+        lev.index = known
+        pos = known.searchsorted(index, side="right") - 1      # latest sampled day ended by t
+        pos_c = np.clip(pos, 0, len(known) - 1)                # before the first: the first (assumption)
+        hrs = index.hour
+        ratio = prof.to_numpy()[pos_c, hrs]
+        ratio = np.where(np.isfinite(ratio), ratio, 1.0)
+        low[c] = np.maximum(floor[c], lev["med"].to_numpy()[pos_c] * ratio)
+        high[c] = np.maximum(floor[c], lev["p90"].to_numpy()[pos_c] * ratio)
+    lo = pd.DataFrame(low, index=index)
+    hi = pd.DataFrame(high, index=index)
+    return lo, hi
